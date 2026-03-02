@@ -1,0 +1,54 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cache-deception-armor",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-01-01",
+
+  // Deploy on a route so fetch() goes to the same origin — no rewrite needed.
+  "routes": [
+    { "pattern": "httpbun.erfi.io/*", "zone_name": "erfi.io" }
+  ],
+
+  "vars": {
+    // Cache TTL as JSON cacheTtlByStatus overrides (merged on top of defaults)
+    // Set to "{}" to use defaults only. Set individual status ranges to 0 to skip caching.
+    "CACHE_TTL": "{}",
+
+    // Browser cache TTL in seconds (Cache-Control: max-age) for legit static assets
+    // Set to 0 to let origin control browser caching
+    "BROWSER_TTL": "3600",
+
+    // When true, blocked responses return 404. When false, return the
+    // response but with Cache-Control: no-store (silent mode)
+    "BLOCK_MODE": "true",
+
+    // Enable debug response headers (x-original-path, x-cleaned-path, etc.)
+    // MUST be "false" in production
+    "DEBUG": "true"
+  },
+
+  "env": {
+    "production": {
+      "routes": [
+        { "pattern": "httpbun.erfi.io/*", "zone_name": "erfi.io" }
+      ],
+      "vars": {
+        "CACHE_TTL": "{}",
+        "BROWSER_TTL": "3600",
+        "BLOCK_MODE": "true",
+        "DEBUG": "false"
+      }
+    },
+    "staging": {
+      "routes": [
+        { "pattern": "httpbun.erfi.io/*", "zone_name": "erfi.io" }
+      ],
+      "vars": {
+        "CACHE_TTL": "{}",
+        "BROWSER_TTL": "0",
+        "BLOCK_MODE": "true",
+        "DEBUG": "true"
+      }
+    }
+  }
+}
