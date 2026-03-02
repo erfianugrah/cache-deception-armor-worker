@@ -80,7 +80,11 @@ export default {
 		// ── Step 3: Content-Type vs extension check (Armor) ────────────────
 
 		if (cacheable && ext) {
-			const mismatch = isContentTypeMismatch(ext, contentType);
+			// 3a. Missing Content-Type — treat as mismatch (origin didn't declare type)
+			const hasContentType = contentType !== '';
+
+			// 3b. Content-Type mismatch check
+			const mismatch = !hasContentType || isContentTypeMismatch(ext, contentType);
 
 			if (mismatch) {
 				const expectedMime = getExpectedMime(ext);
@@ -95,7 +99,8 @@ export default {
 								'x-original-path': originalPath,
 								'x-cleaned-path': url.pathname,
 								'x-expected-type': expectedMime ?? 'unknown',
-								'x-actual-type': contentType,
+								'x-actual-type': contentType || '(missing)',
+								'x-block-reason': !hasContentType ? 'missing-content-type' : 'mime-mismatch',
 							}),
 						},
 					});
@@ -108,6 +113,34 @@ export default {
 					res.headers.set('x-cache-deception-armor', 'blocked-soft');
 					res.headers.set('x-original-path', originalPath);
 					res.headers.set('x-cleaned-path', url.pathname);
+					res.headers.set('x-block-reason', !hasContentType ? 'missing-content-type' : 'mime-mismatch');
+				}
+				return res;
+			}
+
+			// 3c. Respect origin Cache-Control: no-store, private, no-cache
+			//     cacheEverything overrides these, so we must enforce manually.
+			const originCacheControl = (response.headers.get('cache-control') || '').toLowerCase();
+			const originForbidsCache = /\b(no-store|private|no-cache)\b/.test(originCacheControl);
+
+			// 3d. Detect Set-Cookie (should never be in a shared cache)
+			const hasSetCookie = response.headers.has('set-cookie');
+
+			if (originForbidsCache || hasSetCookie) {
+				const res = new Response(response.body, response);
+				res.headers.set('cache-control', 'no-store');
+				// CDN-Cache-Control tells CF edge not to cache (in case cacheEverything already stored it)
+				res.headers.set('cdn-cache-control', 'no-store');
+				if (hasSetCookie) {
+					res.headers.delete('set-cookie');
+				}
+				if (debug) {
+					res.headers.set('x-cache-deception-armor', 'pass-no-cache');
+					res.headers.set('x-original-path', originalPath);
+					res.headers.set('x-cleaned-path', url.pathname);
+					res.headers.set('x-no-cache-reason',
+						[originForbidsCache && 'origin-cache-control', hasSetCookie && 'set-cookie']
+							.filter(Boolean).join(', '));
 				}
 				return res;
 			}
@@ -117,15 +150,24 @@ export default {
 
 		const res = new Response(response.body, response);
 
-		// Set browser cache TTL for legit static assets
-		if (browserTtl > 0 && cacheable) {
-			res.headers.set('cache-control', `public, max-age=${browserTtl}`);
+		if (cacheable) {
+			// Legit static asset — set browser cache TTL
+			if (browserTtl > 0) {
+				res.headers.set('cache-control', `public, max-age=${browserTtl}`);
+			}
+			// Strip Set-Cookie from cached static responses (belt-and-suspenders)
+			res.headers.delete('set-cookie');
+		} else {
+			// Dynamic path (no cacheable extension) — force no-store to prevent
+			// upstream cache rules or page rules from accidentally caching it.
+			res.headers.set('cache-control', 'no-store');
+			res.headers.set('cdn-cache-control', 'no-store');
 		}
 
 		if (debug) {
 			res.headers.set('x-original-path', originalPath);
 			res.headers.set('x-cleaned-path', url.pathname);
-			res.headers.set('x-cache-deception-armor', 'pass');
+			res.headers.set('x-cache-deception-armor', cacheable ? 'pass' : 'dynamic');
 			if (ext) res.headers.set('x-detected-extension', ext);
 		}
 

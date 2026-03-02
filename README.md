@@ -21,7 +21,7 @@ Cloudflare's Cache Deception Armor checks whether the response `Content-Type` ma
 
 ## Solution
 
-This worker implements two layers of defense that run at the edge before cache evaluation.
+This worker implements three layers of defense that run at the edge before cache evaluation.
 
 ### Layer 1: URL Normalization (primary defense)
 
@@ -43,13 +43,25 @@ Removes attack payloads so the URL never looks like a static asset:
 If an extension survives normalization, the worker checks the origin's `Content-Type` against the expected type for that extension using the [`mime`](https://www.npmjs.com/package/mime) library. The set of protected extensions is [Cloudflare's default cacheable file extensions](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/#default-cached-file-extensions).
 
 Matching rules:
+- **Missing Content-Type**: no header at all — **blocked** (fail closed, cannot validate)
 - **Exact match**: `text/css` for `.css` — pass
 - **Fuzzy category match** for binary types: `image/webp` for `.jpg` — pass (same `image/*` category)
 - **Strict match** for `text/*` and `application/*`: `text/html` for `.css` — **blocked** (prevents the `text/html` vs `text/css` same-category bypass)
-- **Cross-category overrides**: known acceptable variations like `.gif` served as `video/webm`
-- **`application/octet-stream`**: always allowed (signals download, not display)
+- **Cross-category overrides**: known acceptable variations like `.gif` served as `video/webm` ([CF docs](https://developers.cloudflare.com/cache/cache-security/cache-deception-armor/) confirm these exceptions)
+- **`application/octet-stream`**: always allowed (signals download, not display — [confirmed by CF docs](https://developers.cloudflare.com/cache/cache-security/cache-deception-armor/))
 
-Mismatches result in a `404` with `Cache-Control: no-store`.
+Mismatches result in a `404` with `Cache-Control: no-store` (hard block) or the original response with `Cache-Control: no-store` (soft block), depending on `BLOCK_MODE`.
+
+### Layer 3: Cache Safety Guards
+
+Even after MIME validation passes, additional checks prevent sensitive data from leaking into the shared cache:
+
+| Guard | What it does | Why |
+|-------|-------------|-----|
+| **Respect origin `Cache-Control`** | If origin sends `no-store`, `private`, or `no-cache`, the worker enforces it even though `cacheEverything` would normally override | Prevents caching when origin explicitly forbids it ([CF docs warn about this](https://developers.cloudflare.com/cache/cache-security/cache-deception-armor/)) |
+| **Strip `Set-Cookie`** | Removes `Set-Cookie` headers from any response that will be cached; also blocks caching if `Set-Cookie` is present on a cacheable-extension response | Session tokens in a shared cache = account takeover |
+| **Force `no-store` on dynamic paths** | Responses without a cacheable extension get `Cache-Control: no-store` and `CDN-Cache-Control: no-store` | Prevents upstream page rules or cache rules from accidentally caching dynamic content |
+| **Block missing `Content-Type`** | If origin returns no `Content-Type` header at all, the response is treated as a mismatch and blocked | Cannot validate what we cannot see — fail closed |
 
 ### Request Flow
 
@@ -70,21 +82,27 @@ Incoming request
            |
            v
 +---------------------+
-| 3. ARMOR CHECK      |  does cleaned path have a cacheable extension?
-|                     |  if yes: does Content-Type match? (via mime library)
-|                     |  mismatch -> 404 (no-store)
+| 3. ARMOR CHECK      |  missing Content-Type? -> blocked
+|                     |  cacheable extension + MIME mismatch? -> 404 (no-store)
++----------+----------+
+           |
+           v
++---------------------+
+| 4. CACHE GUARDS     |  origin says no-store/private? -> no-store + cdn-cache-control
+|                     |  Set-Cookie present? -> strip + no-store
+|                     |  no cacheable extension? -> force no-store (dynamic path)
 +----------+----------+
            |
            v
       Return response
 ```
 
-Normalization is the primary defense — it removes the attack payload before it hits origin or cache. The Armor check is the safety net for anything that slips through.
+Normalization is the primary defense — it removes the attack payload before it hits origin or cache. The Armor check is the safety net for anything that slips through. The cache guards are the belt-and-suspenders layer that prevents sensitive data from ever entering the shared cache.
 
 ## Project Structure
 
 ```
-cache-deception-test/
+cache-deception-armor-worker/
   src/
     index.ts              # Worker entry point — fetch + armor check
     normalize.ts          # URL normalization module (decode, strip, resolve, lowercase)
@@ -128,9 +146,12 @@ Settings are in `wrangler.jsonc`:
 ### Environments
 
 ```bash
-wrangler dev                    # Dev (DEBUG=true)
-wrangler dev --env staging      # Staging (no browser caching, DEBUG=true)
-wrangler deploy --env production # Production (DEBUG=false)
+npm run dev                     # Local dev (DEBUG=true)
+npm run dev:remote              # Remote dev on CF edge (DEBUG=true)
+npm run deploy:staging          # Deploy staging (no browser caching, DEBUG=true)
+npm run deploy:production       # Deploy production (DEBUG=false)
+npm test                        # Run unit tests (319 tests)
+npm run cf-typegen              # Regenerate worker-configuration.d.ts
 ```
 
 | Setting | Dev | Staging | Production |
@@ -148,9 +169,33 @@ wrangler deploy --env production # Production (DEBUG=false)
 { "200-299": 86400, "304": 86400, "404": 60, "400-403": 0, "500-599": 0 }
 ```
 
-The Armor check runs **before** caching, so only responses with matching Content-Type are cached.
-
 `BROWSER_TTL` sets `Cache-Control: public, max-age=<value>` on responses that pass the Armor check and have a cacheable extension. Set to `0` to preserve the origin's headers.
+
+### What gets cached vs what doesn't
+
+| Scenario | Edge cache | Browser cache | Headers set |
+|----------|-----------|---------------|-------------|
+| Cacheable extension + MIME matches | Yes (`cacheEverything`) | Yes (`BROWSER_TTL`) | `Cache-Control: public, max-age=N` |
+| Cacheable extension + MIME mismatch | No | No | `Cache-Control: no-store` (404 response) |
+| Cacheable extension + missing Content-Type | No | No | `Cache-Control: no-store` (404 response) |
+| Cacheable extension + origin says `no-store`/`private` | No | No | `Cache-Control: no-store`, `CDN-Cache-Control: no-store` |
+| Cacheable extension + `Set-Cookie` present | No | No | `Set-Cookie` stripped, `Cache-Control: no-store` |
+| No cacheable extension (dynamic path) | No | No | `Cache-Control: no-store`, `CDN-Cache-Control: no-store` |
+
+### Debug headers
+
+When `DEBUG=true`, the worker adds response headers for troubleshooting:
+
+| Header | Values | When |
+|--------|--------|------|
+| `x-original-path` | Original request path before normalization | Always |
+| `x-cleaned-path` | Path after normalization | Always |
+| `x-cache-deception-armor` | `pass`, `dynamic`, `blocked`, `blocked-soft`, `pass-no-cache` | Always |
+| `x-detected-extension` | e.g. `css`, `jpg` | When cacheable extension found |
+| `x-expected-type` | e.g. `text/css` | On mismatch block |
+| `x-actual-type` | e.g. `text/html` or `(missing)` | On mismatch block |
+| `x-block-reason` | `mime-mismatch` or `missing-content-type` | On mismatch block |
+| `x-no-cache-reason` | `origin-cache-control`, `set-cookie`, or both | When cache guards intervene |
 
 ### Local development
 
@@ -228,25 +273,27 @@ BASE="http://127.0.0.1:9000" bash test.sh
 
 | Test | Path | Result |
 |------|------|--------|
-| Clean dynamic path | `/account/settings` | pass (no cacheable extension) |
-| Real static asset | `/static/image.jpg` | pass (Content-Type matches `image/*`) |
+| Clean dynamic path | `/account/settings` | dynamic (no cacheable extension, `Cache-Control: no-store` enforced) |
+| Real static asset | `/static/image.jpg` | pass (Content-Type matches `image/*`, cached) |
 
-## Deploying to Production
+## Deploying
 
 ### As a Cloudflare Worker (recommended)
 
-Add a route binding in `wrangler.jsonc`:
+The route binding is already configured in `wrangler.jsonc`. To deploy:
+
+```bash
+npm run deploy:production    # production (DEBUG=false)
+npm run deploy:staging       # staging (DEBUG=true, BROWSER_TTL=0)
+npm run deploy               # default env
+```
+
+To use on a different domain, update the `routes` in `wrangler.jsonc`:
 
 ```jsonc
 "routes": [
-  { "pattern": "example.com/*", "zone_name": "example.com" }
+  { "pattern": "yourdomain.com/*", "zone_name": "yourdomain.com" }
 ]
-```
-
-Then deploy:
-
-```bash
-wrangler deploy --env production
 ```
 
 ### As a Cloudflare Snippet
